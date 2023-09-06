@@ -107,7 +107,7 @@ TEXT_ENCODER_OUTPUTS_CACHE_SUFFIX = "_te_outputs.npz"
 
 
 class ImageInfo:
-    def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str) -> None:
+    def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str, image_id: int = None, parent_id: int = None) -> None:
         self.image_key: str = image_key
         self.num_repeats: int = num_repeats
         self.caption: str = caption
@@ -128,6 +128,8 @@ class ImageInfo:
         self.text_encoder_outputs1: Optional[torch.Tensor] = None
         self.text_encoder_outputs2: Optional[torch.Tensor] = None
         self.text_encoder_pool2: Optional[torch.Tensor] = None
+        self.image_id = image_id
+        self.parent_id = parent_id
 
 
 class BucketManager:
@@ -790,7 +792,8 @@ class BaseDataset(torch.utils.data.Dataset):
             #   self.buckets_indices.append(BucketBatchIndex(bucket_index, bucket_batch_size, batch_index))
             # ↑ここまで
 
-        self.shuffle_buckets()
+        # Disable bucket shuffle
+        # self.shuffle_buckets()
         self._length = len(self.buckets_indices)
 
     def shuffle_buckets(self):
@@ -1028,11 +1031,15 @@ class BaseDataset(torch.utils.data.Dataset):
         text_encoder_outputs1_list = []
         text_encoder_outputs2_list = []
         text_encoder_pool2_list = []
+        image_ids = []
+        parent_ids = []
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
             subset = self.image_to_subset[image_key]
             loss_weights.append(self.prior_loss_weight if image_info.is_reg else 1.0)
+            image_ids.append(image_info.image_id)
+            parent_ids.append(image_info.parent_id)
 
             flipped = subset.flip_aug and random.random() < 0.5  # not flipped or flipped with 50% chance
 
@@ -1067,20 +1074,27 @@ class BaseDataset(torch.utils.data.Dataset):
                     if face_cx > 0:  # 顔位置情報あり
                         img = self.crop_target(subset, img, face_cx, face_cy, face_w, face_h)
                     elif im_h > self.height or im_w > self.width:
-                        assert (
-                            subset.random_crop
-                        ), f"image too large, but cropping and bucketing are disabled / 画像サイズが大きいのでface_crop_aug_rangeかrandom_crop、またはbucketを有効にしてください: {image_info.absolute_path}"
-                        if im_h > self.height:
-                            p = random.randint(0, im_h - self.height)
-                            img = img[p : p + self.height]
-                        if im_w > self.width:
-                            p = random.randint(0, im_w - self.width)
-                            img = img[:, p : p + self.width]
+                        # assert (
+                        #     subset.random_crop
+                        # ), f"image too large, but cropping and bucketing are disabled / 画像サイズが大きいのでface_crop_aug_rangeかrandom_crop、またはbucketを有効にしてください: {image_info.absolute_path}"
+                        # if im_h > self.height:
+                        #     p = random.randint(0, im_h - self.height)
+                        #     img = img[p : p + self.height]
+                        # if im_w > self.width:
+                        #     p = random.randint(0, im_w - self.width)
+                        #     img = img[:, p : p + self.width]
+                        pass
+                        
+                    # modify the default behavior, resize the image
+                    ratio_h = im_h / self.height
+                    ratio_w = im_w / self.width
+                    ratio = max(ratio_h, ratio_w)
+                    img = cv2.resize(img, (int(im_w / ratio), int(im_h / ratio)), interpolation=cv2.INTER_AREA)
 
                     im_h, im_w = img.shape[0:2]
-                    assert (
-                        im_h == self.height and im_w == self.width
-                    ), f"image size is small / 画像サイズが小さいようです: {image_info.absolute_path}"
+                    # assert (
+                    #     im_h == self.height and im_w == self.width
+                    # ), f"image size is small / 画像サイズが小さいようです: {image_info.absolute_path}"
 
                     original_size = [im_w, im_h]
                     crop_ltrb = (0, 0, 0, 0)
@@ -1156,6 +1170,8 @@ class BaseDataset(torch.utils.data.Dataset):
 
         example = {}
         example["loss_weights"] = torch.FloatTensor(loss_weights)
+        example["image_id"] = image_ids
+        example["parent_id"] = parent_ids
 
         if len(text_encoder_outputs1_list) == 0:
             if self.token_padding_disabled:
@@ -1521,7 +1537,9 @@ class FineTuningDataset(BaseDataset):
                 if caption is None:
                     caption = ""
 
-                image_info = ImageInfo(image_key, subset.num_repeats, caption, False, abs_path)
+                image_id = img_md.get("id")
+                parent_id = img_md.get("parent")
+                image_info = ImageInfo(image_key, subset.num_repeats, caption, False, abs_path, image_id, parent_id)
                 image_info.image_size = img_md.get("train_resolution")
 
                 if not subset.color_aug and not subset.random_crop:
@@ -4213,18 +4231,22 @@ def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator, step_n
                 shutil.rmtree(state_dir_old)
 
 
-def save_state_on_train_end(args: argparse.Namespace, accelerator):
-    model_name = default_if_none(args.output_name, DEFAULT_LAST_OUTPUT_NAME)
+def save_state_on_train_end(args: argparse.Namespace, accelerator, name: str = None):
+    if name is None:
+        model_name = default_if_none(args.output_name, DEFAULT_LAST_OUTPUT_NAME)
+        model_name = LAST_STATE_NAME.format(model_name)
+    else:
+        model_name = name
 
     print("\nsaving last state.")
     os.makedirs(args.output_dir, exist_ok=True)
 
-    state_dir = os.path.join(args.output_dir, LAST_STATE_NAME.format(model_name))
+    state_dir = os.path.join(args.output_dir, name)
     accelerator.save_state(state_dir)
 
     if args.save_state_to_huggingface:
         print("uploading last state to huggingface.")
-        huggingface_util.upload(args, state_dir, "/" + LAST_STATE_NAME.format(model_name))
+        huggingface_util.upload(args, state_dir, "/" + name)
 
 
 def save_sd_model_on_train_end(
@@ -4439,6 +4461,7 @@ def sample_images_common(
     rng_state = torch.get_rng_state()
     cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
 
+    images = []
     with torch.no_grad():
         # with accelerator.autocast():
         for i, prompt in enumerate(prompts):
@@ -4551,7 +4574,8 @@ def sample_images_common(
                 f"{'' if args.output_name is None else args.output_name + '_'}{ts_str}_{num_suffix}_{i:02d}{seed_suffix}.png"
             )
 
-            image.save(os.path.join(save_dir, img_filename))
+            # image.save(os.path.join(save_dir, img_filename))
+            images.append(image)
 
             # wandb有効時のみログを送信
             try:
@@ -4573,6 +4597,8 @@ def sample_images_common(
     if cuda_rng_state is not None:
         torch.cuda.set_rng_state(cuda_rng_state)
     vae.to(org_vae_device)
+
+    return images
 
 
 # endregion
